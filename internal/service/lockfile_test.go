@@ -81,6 +81,212 @@ func TestCreateLockfileAndResolveWith(t *testing.T) {
 	}
 }
 
+func TestResolveWithLockfileDetectsDependencyDrift(t *testing.T) {
+	s := newTestService(t)
+	if _, err := s.CreateArtifact("app"); err != nil {
+		t.Fatal(err)
+	}
+	lib, err := s.CreateArtifact("lib")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateVersion("app", "1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateVersion("lib", "1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceDependencies("app", "1.0.0", []DependencyInput{
+		{Artifact: "lib", Constraint: ">=1.0.0"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rootVersion := "1.0.0"
+	baselineResolution, err := s.Resolve("app", &rootVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baselineResolution.Status != "succeeded" {
+		t.Fatalf("baseline status = %s", baselineResolution.Status)
+	}
+	baselineLock, err := s.CreateLockfile(baselineResolution.ResolutionID, "baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasLockPin(baselineLock.Artifacts, "app", "1.0.0") || !hasLockPin(baselineLock.Artifacts, "lib", "1.0.0") {
+		t.Fatalf("baseline lockfile missing lib@1.0.0: %+v", baselineLock.Artifacts)
+	}
+
+	for _, version := range []string{"1.1.0", "2.0.0"} {
+		if _, err := s.CreateVersion("lib", version); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	verify, err := s.ResolveWithLockfile("baseline", "app", &rootVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verify.Status != "drifted" {
+		t.Fatalf("expected drifted status, got %s", verify.Status)
+	}
+	if verify.Lockfile != "baseline" {
+		t.Fatalf("lockfile = %q", verify.Lockfile)
+	}
+	if got := resolvedVersion(verify.Resolved, "app"); got != "1.0.0" {
+		t.Fatalf("expected resolved app@1.0.0, got %q", got)
+	}
+	if got := resolvedVersion(verify.Resolved, "lib"); got != "2.0.0" {
+		t.Fatalf("expected resolved lib@2.0.0, got %q", got)
+	}
+	if len(verify.Drifted) != 1 || verify.Drifted[0] != (DriftEntry{Artifact: "lib", Locked: "1.0.0", Resolved: "2.0.0"}) {
+		t.Fatalf("drift = %+v", verify.Drifted)
+	}
+
+	unchangedLock, err := s.GetLockfile("baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasLockPin(unchangedLock.Artifacts, "app", "1.0.0") || !hasLockPin(unchangedLock.Artifacts, "lib", "1.0.0") {
+		t.Fatalf("lockfile pin changed: %+v", unchangedLock.Artifacts)
+	}
+
+	items, err := s.store.ListResolutionItems(verify.ResolutionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range items {
+		if item.ArtifactID == lib.ID {
+			found = true
+			if item.SelectedVersion != "2.0.0" {
+				t.Fatalf("persisted lib version = %s", item.SelectedVersion)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("persisted resolution missing lib item: %+v", items)
+	}
+}
+
+func TestResolveLockfileEndpointDetectsDependencyDrift(t *testing.T) {
+	s := newTestService(t)
+	if _, err := s.CreateArtifact("app"); err != nil {
+		t.Fatal(err)
+	}
+	lib, err := s.CreateArtifact("lib")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateVersion("app", "1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateVersion("lib", "1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceDependencies("app", "1.0.0", []DependencyInput{
+		{Artifact: "lib", Constraint: ">=1.0.0"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rootVersion := "1.0.0"
+	baseline, err := s.Resolve("app", &rootVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseline.Status != "succeeded" {
+		t.Fatalf("baseline status = %s", baseline.Status)
+	}
+	if _, err := s.CreateLockfile(baseline.ResolutionID, "baseline"); err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []string{"1.1.0", "2.0.0"} {
+		if _, err := s.CreateVersion("lib", version); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	payload, err := json.Marshal(map[string]string{
+		"lockfile": "baseline",
+		"artifact": "app",
+		"version":  "1.0.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/resolve/lockfile", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/resolve/lockfile" {
+			http.NotFound(w, r)
+			return
+		}
+		var in struct {
+			Lockfile string `json:"lockfile"`
+			Artifact string `json:"artifact"`
+			Version  string `json:"version"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		verify, err := s.ResolveWithLockfile(in.Lockfile, in.Artifact, &in.Version)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(verify)
+	}).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var verify LockfileVerifyOutput
+	if err := json.NewDecoder(rec.Body).Decode(&verify); err != nil {
+		t.Fatal(err)
+	}
+	if verify.Status != "drifted" {
+		t.Fatalf("expected drifted status, got %s", verify.Status)
+	}
+	if got := resolvedVersion(verify.Resolved, "lib"); got != "2.0.0" {
+		t.Fatalf("expected resolved lib@2.0.0, got %q", got)
+	}
+	if len(verify.Drifted) != 1 || verify.Drifted[0] != (DriftEntry{Artifact: "lib", Locked: "1.0.0", Resolved: "2.0.0"}) {
+		t.Fatalf("drift = %+v", verify.Drifted)
+	}
+	if verify.ResolutionID == 0 {
+		t.Fatal("expected resolution id")
+	}
+
+	lock, err := s.GetLockfile("baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasLockPin(lock.Artifacts, "app", "1.0.0") || !hasLockPin(lock.Artifacts, "lib", "1.0.0") || hasLockPin(lock.Artifacts, "lib", "2.0.0") {
+		t.Fatalf("lockfile pins = %+v", lock.Artifacts)
+	}
+	items, err := s.store.ListResolutionItems(verify.ResolutionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, item := range items {
+		if item.ArtifactID == lib.ID {
+			found = true
+			if item.SelectedVersion != "2.0.0" {
+				t.Fatalf("persisted lib version = %s", item.SelectedVersion)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("persisted resolution missing lib item: %+v", items)
+	}
+}
+
 func TestPOSTResolveLockfileReportsDriftAndPersistsLatestResolution(t *testing.T) {
 	s := newTestService(t)
 
@@ -230,6 +436,15 @@ func resolvedVersion(entries []ResolvedEntry, artifact string) string {
 		}
 	}
 	return ""
+}
+
+func hasLockPin(entries []LockfilePinEntry, artifact, version string) bool {
+	for _, entry := range entries {
+		if entry.Artifact == artifact && entry.Version == version {
+			return true
+		}
+	}
+	return false
 }
 
 func pinnedVersion(entries []LockfilePinEntry, artifact string) string {
